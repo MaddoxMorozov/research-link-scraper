@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Research Link Scraper - Ops Center</title>
+    <style>
+        :root {
+            --bg-color: #09090b;
+            --card-bg: rgba(24, 24, 27, 0.6);
+            --border: rgba(255, 255, 255, 0.1);
+            --text-primary: #fafafa;
+            --text-secondary: #a1a1aa;
+            --accent: #3b82f6;
+            --success: #10b981;
+            --error: #ef4444;
+            --warning: #f59e0b;
+            --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            min-height: 100vh;
+            background-image: radial-gradient(circle at top right, rgba(59, 130, 246, 0.1) 0%, transparent 40%);
+        }
+        .container {
+            max-width: 1000px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            backdrop-filter: blur(10px);
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .brand h1 { margin: 0; font-size: 1.25rem; font-weight: 600; letter-spacing: -0.5px; }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--success);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.5); opacity: 0.5; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        /* Uptime Badge */
+        .uptime {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            background: rgba(255,255,255,0.05);
+            padding: 6px 12px;
+            border-radius: 6px;
+        }
+
+        /* KPI Grid */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 15px;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            backdrop-filter: blur(10px);
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }
+        .card:hover { border-color: rgba(255,255,255,0.2); }
+        .card h3 {
+            margin: 0;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+        .card .value {
+            font-size: 2rem;
+            font-weight: 700;
+            font-feature-settings: "tnum";
+            color: var(--text-primary);
+        }
+        .card .subtext {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        /* Activity Bar */
+        .activity-bar {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            font-size: 0.9rem;
+        }
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid var(--accent);
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+
+        /* Terminal Logs */
+        .logs-window {
+            background: #000;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            flex-grow: 1;
+        }
+        .logs-header {
+            background: #18181b;
+            padding: 8px 16px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+        }
+        .logs-content {
+            padding: 16px;
+            height: 350px;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            line-height: 1.6;
+            scroll-behavior: smooth;
+        }
+        .log-entry { margin-bottom: 4px; display: flex; gap: 10px; }
+        .log-time { color: var(--text-secondary); opacity: 0.6; min-width: 65px; }
+        .log-msg { color: var(--text-primary); word-break: break-all; }
+        .log-entry.error .log-msg { color: var(--error); }
+        .log-entry.warning .log-msg { color: var(--warning); }
+        .log-entry.info .log-msg { color: var(--text-primary); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="brand">
+                <div class="status-dot"></div>
+                <h1>Research Scraper Ops</h1>
+            </div>
+            <div class="uptime" id="uptime-display">UPTIME: 0h 0m</div>
+        </header>
+
+        <div class="grid">
+            <!-- Processed -->
+            <div class="card">
+                <h3>Processed</h3>
+                <div class="value" id="processed-count">0</div>
+                <div class="subtext">Success Rate: <span id="success-rate" style="color: var(--success)">100%</span></div>
+            </div>
+
+            <!-- Errors -->
+            <div class="card">
+                <h3>Errors</h3>
+                <div class="value" id="error-count" style="color: var(--error)">0</div>
+                <div class="subtext">Total incidents</div>
+            </div>
+
+            <!-- Avg Time -->
+            <div class="card">
+                <h3>Avg Speed</h3>
+                <div class="value" id="avg-time">0.0s</div>
+                <div class="subtext">Per document</div>
+            </div>
+
+            <!-- Next Scan -->
+            <div class="card">
+                <h3>Next Scan</h3>
+                <div class="value" id="next-scan">00:00</div>
+                <div class="subtext" id="scan-subtext">Checking soon...</div>
+            </div>
+        </div>
+
+        <div class="activity-bar">
+            <div class="spinner"></div>
+            <span id="current-activity">Initializing system...</span>
+        </div>
+
+        <div class="logs-window">
+            <div class="logs-header">
+                <span>TERMINAL OUTPUT</span>
+                <span>TAIL -F</span>
+            </div>
+            <div class="logs-content" id="logs-terminal">
+                <!-- Logs injected here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateDashboard() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    // Update Counts
+                    document.getElementById('processed-count').textContent = data.processed_count;
+                    document.getElementById('error-count').textContent = data.error_count;
+                    
+                    // Success Rate
+                    const total = data.processed_count + data.error_count;
+                    const rate = total > 0 ? ((data.processed_count / total) * 100).toFixed(1) : 100;
+                    document.getElementById('success-rate').textContent = `${rate}%`;
+                    document.getElementById('success-rate').style.color = rate < 90 ? 'var(--warning)' : 'var(--success)';
+
+                    // Avg Time
+                    const avg = data.processed_count > 0 ? (data.total_duration_seconds / data.processed_count).toFixed(1) : "0.0";
+                    document.getElementById('avg-time').textContent = `${avg}s`;
+
+                    // Activity
+                    document.getElementById('current-activity').textContent = data.last_activity;
+
+                    // Uptime
+                    const h = Math.floor(data.uptime_seconds / 3600);
+                    const m = Math.floor((data.uptime_seconds % 3600) / 60);
+                    document.getElementById('uptime-display').textContent = `UPTIME: ${h}h ${m}m`;
+
+                    // Next Scan Countdown
+                    if (data.next_poll_time) {
+                        const now = Date.now() / 1000;
+                        const diff = Math.max(0, data.next_poll_time - now);
+                        const mm = Math.floor(diff / 60).toString().padStart(2, '0');
+                        const ss = Math.floor(diff % 60).toString().padStart(2, '0');
+                        document.getElementById('next-scan').textContent = `${mm}:${ss}`;
+                        
+                        if (diff > 0) {
+                            document.getElementById('scan-subtext').textContent = "Until next check";
+                            document.querySelector('.spinner').style.borderTopColor = 'var(--text-secondary)'; // Pause spinner visual?
+                        } else {
+                             document.getElementById('scan-subtext').textContent = "Scanning now...";
+                             document.querySelector('.spinner').style.borderTopColor = 'transparent'; // Spin!
+                        }
+                    } else {
+                        document.getElementById('next-scan').textContent = "--:--";
+                    }
+
+                    // Logs
+                    const logsDiv = document.getElementById('logs-terminal');
+                    logsDiv.innerHTML = '';
+                    data.recent_logs.forEach(log => {
+                        // Simple parse expected: "HH:MM:SS - Msg"
+                        let timePart = log.substring(0, 8); 
+                        let msgPart = log.substring(11);
+                        
+                        const row = document.createElement('div');
+                        let type = 'info';
+                        if (log.toLowerCase().includes('error')) type = 'error';
+                        if (log.toLowerCase().includes('warning')) type = 'warning';
+                        
+                        row.className = `log-entry ${type}`;
+                        row.innerHTML = `<span class="log-time">${timePart}</span><span class="log-msg">${msgPart}</span>`;
+                        logsDiv.appendChild(row);
+                    });
+                })
+                .catch(e => console.error(e));
+        }
+
+        setInterval(updateDashboard, 1000);
+        updateDashboard();
+    </script>
+</body>
+</html>

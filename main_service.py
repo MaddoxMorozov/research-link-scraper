@@ -23,15 +23,70 @@ import config
 # Configuration accessed via config.py
 # SPREADSHEET_ID and POLL_INTERVAL are now in config.py
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [SERVICE] - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(config.SERVICE_LOG_FILE),
-        logging.StreamHandler()
-    ]
-)
+# Dashboard State
+class ServiceState:
+    def __init__(self):
+        self.start_time = time.time()
+        self.processed_count = 0
+        self.error_count = 0
+        self.last_activity = "Initializing..."
+        self.recent_logs = []
+        
+        # Advanced Metrics
+        self.total_duration_seconds = 0.0
+        self.last_success_time = None
+        self.next_poll_time = None
+
+    def log(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        entry = f"{timestamp} - {message}"
+        self.recent_logs.append(entry)
+        if len(self.recent_logs) > 50:
+            self.recent_logs.pop(0)
+
+dashboard_state = ServiceState()
+
+class InMemoryLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            dashboard_state.recent_logs.append(log_entry)
+            if len(dashboard_state.recent_logs) > 50:
+                dashboard_state.recent_logs.pop(0)
+            
+            # Sync Error Count with actual Error Logs
+            if record.levelno >= logging.ERROR:
+                dashboard_state.error_count += 1
+        except Exception:
+            self.handleError(record)
+
+# Setup logging - Force handlers to ensure valid capture
+# (basicConfig can be ignored if a library has already set up logging)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Clear existing handlers to avoid duplicates during reloads (or if libs added default ones)
+if root_logger.handlers:
+    root_logger.handlers = []
+
+formatter = logging.Formatter('%(asctime)s - [SERVICE] - %(levelname)s - %(message)s')
+
+# 1. File Handler
+file_handler = logging.FileHandler(config.SERVICE_LOG_FILE)
+file_handler.setFormatter(formatter)
+root_logger.addHandler(file_handler)
+
+# 2. Console Handler
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+root_logger.addHandler(stream_handler)
+
+# 3. Dashboard Memory Handler
+memory_handler = InMemoryLogHandler()
+memory_handler.setFormatter(formatter)
+root_logger.addHandler(memory_handler)
+
+logging.info("Logging system initialized. Dashboard handler active.")
 
 class ResearchService:
     def __init__(self):
@@ -60,11 +115,11 @@ class ResearchService:
 
     def check_and_process(self):
         logging.info("Checking Google Sheet for new tasks...")
+        dashboard_state.last_activity = "Checking for new tasks..."
         try:
             worksheet = self.get_worksheet()
             
             # Get all values
-            records = worksheet.get_all_records()
             all_values = worksheet.get_all_values()
             if not all_values:
                 logging.warning("Sheet appears empty.")
@@ -76,6 +131,7 @@ class ResearchService:
                 result_col_idx = header.index(config.OUTPUT_COLUMN_NAME)
             except ValueError as e:
                 logging.error(f"Missing required columns in Sheet: {e}")
+                dashboard_state.error_count += 1
                 return
 
             # Iterate rows (skip header)
@@ -89,6 +145,7 @@ class ResearchService:
                 
                 if draft_link and not current_status:
                     logging.info(f"Found new task at Row {i}: {draft_link}")
+                    dashboard_state.last_activity = f"Processing Row {i}..."
                     # Mark as processing immediately to avoid double-process
                     try:
                         worksheet.update_cell(i, result_col_idx + 1, "Processing...")
@@ -100,6 +157,7 @@ class ResearchService:
                     
         except Exception as e:
             logging.error(f"Error checking sheet: {e}")
+            dashboard_state.error_count += 1
 
     def process_task(self, worksheet, row_num, draft_link, result_col_index):
         # 0. Check if it's a Spreadsheet (common mistake)
@@ -159,11 +217,15 @@ class ResearchService:
             tasks = [self.scraper.process_link(link) for link in links]
             await asyncio.gather(*tasks)
 
+        # Track duration
+        start_time = time.time()
+
         try:
             asyncio.run(run_scrape())
         except Exception as e:
              logging.error(f"Scraping execution error: {e}")
              worksheet.update_cell(row_num, result_col_index, "Error: Scraping execution failed")
+             dashboard_state.error_count += 1
              return
         
         # 3. Upload to Drive
@@ -176,8 +238,17 @@ class ResearchService:
                 try:
                     worksheet.update_cell(row_num, result_col_index, drive_link)
                     logging.info(f"Task Complete. Updated Sheet Row {row_num}.")
+                    
+                    # Update Metrics
+                    dashboard_state.processed_count += 1
+                    dashboard_state.last_activity = "Task Complete"
+                    dashboard_state.last_success_time = time.time()
+                    duration = time.time() - start_time
+                    dashboard_state.total_duration_seconds += duration
+                    
                 except Exception as e:
                     logging.error(f"Failed to update sheet for Row {row_num}: {e}")
+                    dashboard_state.error_count += 1
 
                 # 5. Cleanup Local File
                 try:
@@ -187,8 +258,10 @@ class ResearchService:
                     logging.warning(f"Failed to delete local file: {e}")
             else:
                  worksheet.update_cell(row_num, result_col_index, "Error: Drive Upload Failed")
+                 dashboard_state.error_count += 1
         else:
              worksheet.update_cell(row_num, result_col_index, "Error: No content scraped")
+             dashboard_state.error_count += 1
              
     def upload_to_drive(self, filepath, filename):
         max_retries = 3
@@ -225,15 +298,46 @@ class ResearchService:
 
 
 def start_keep_alive_server():
-    """Starts a dummy web server to satisfy Render's port binding requirement."""
+    """Starts a web server to serve the Dashboard and satisfy Render's port binding."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import threading
+    import json
 
-    class HealthCheckHandler(BaseHTTPRequestHandler):
+    class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Service is running")
+            if self.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                # Serve the embedded dashboard or read from file
+                try:
+                    with open('dashboard_template.html', 'r', encoding='utf-8') as f:
+                        self.wfile.write(f.read().encode('utf-8'))
+                except FileNotFoundError:
+                    self.wfile.write(b"<h1>Dashboard Error</h1><p>Template not found.</p>")
+            
+            elif self.path == '/api/status':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                uptime = time.time() - dashboard_state.start_time
+                stats = {
+                    'uptime_seconds': uptime,
+                    'processed_count': dashboard_state.processed_count,
+                    'error_count': dashboard_state.error_count,
+                    'last_activity': dashboard_state.last_activity,
+                    'total_duration_seconds': dashboard_state.total_duration_seconds,
+                    'last_success_time': dashboard_state.last_success_time,
+                    'next_poll_time': dashboard_state.next_poll_time,
+                    'recent_logs': list(dashboard_state.recent_logs) # Copy list
+                }
+                self.wfile.write(json.dumps(stats).encode('utf-8'))
+            
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Not Found")
         
         # Suppress log messages to keep console clean
         def log_message(self, format, *args):
@@ -241,13 +345,13 @@ def start_keep_alive_server():
 
     port = int(os.environ.get("PORT", 10000))
     try:
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        server = HTTPServer(("0.0.0.0", port), DashboardHandler)
         server_thread = threading.Thread(target=server.serve_forever)
         server_thread.daemon = True
         server_thread.start()
-        print(f"--- Keep-alive server started on port {port} ---")
+        print(f"--- Dashboard & Keep-alive server started on port {port} ---")
     except Exception as e:
-        print(f"Warning: Failed to start keep-alive server: {e}")
+        print(f"Warning: Failed to start web server: {e}")
 
 def main():
     print("--- Starting Research Link Scraper Service (Production) ---")
@@ -271,11 +375,15 @@ def main():
             sys.exit(0)
         except Exception as e:
             error_count += 1
+            dashboard_state.error_count += 1
+            dashboard_state.last_activity = "Recovering from error..."
             wait_time = min(config.POLL_INTERVAL * (2 ** (error_count - 1)), 300) # Max 5 min wait
             logging.error(f"Critical Service Error: {e}. Retrying in {wait_time}s...")
+            dashboard_state.next_poll_time = time.time() + wait_time
             time.sleep(wait_time)
             continue
             
+        dashboard_state.next_poll_time = time.time() + config.POLL_INTERVAL
         time.sleep(config.POLL_INTERVAL)
 
 if __name__ == "__main__":
