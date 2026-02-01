@@ -47,8 +47,11 @@ class DocScraper:
         creds = None
         
         # 1. Try to load from Environment Variables (Cloud/Render)
+        print(f"DEBUG: Available Env Vars: {list(os.environ.keys())}")
         env_token = os.environ.get("GOOGLE_TOKEN_JSON")
         env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        print(f"DEBUG: GOOGLE_TOKEN_JSON present: {bool(env_token)}, Length: {len(env_token) if env_token else 0}")
+        print(f"DEBUG: GOOGLE_CREDENTIALS_JSON present: {bool(env_creds)}")
 
         if env_token:
             import json
@@ -58,6 +61,7 @@ class DocScraper:
                 creds = Credentials.from_authorized_user_info(info, SCOPES)
                 logging.info("Authenticated using GOOGLE_TOKEN_JSON environment variable.")
             except Exception as e:
+                print(f"DEBUG: JSON Load Error: {e}")
                 logging.error(f"Failed to load token from Env Var: {e}")
 
         # 2. Try to load from Local File (if Env Var didn't work or wasn't present)
