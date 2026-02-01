@@ -223,10 +223,39 @@ class ResearchService:
                     logging.error(f"Drive Upload Failed after {max_retries} attempts.")
                     return None
 
+
+def start_keep_alive_server():
+    """Starts a dummy web server to satisfy Render's port binding requirement."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Service is running")
+        
+        # Suppress log messages to keep console clean
+        def log_message(self, format, *args):
+            pass
+
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        print(f"--- Keep-alive server started on port {port} ---")
+    except Exception as e:
+        print(f"Warning: Failed to start keep-alive server: {e}")
+
 def main():
     print("--- Starting Research Link Scraper Service (Production) ---")
     print(f"Monitoring Sheet ID: {config.SPREADSHEET_ID}")
     print("Press Ctrl+C to stop.")
+    
+    # Start the keep-alive server
+    start_keep_alive_server()
     
     service = ResearchService()
     
