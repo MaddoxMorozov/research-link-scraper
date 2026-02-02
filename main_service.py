@@ -8,6 +8,8 @@ import re
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from datetime import datetime
+import urllib.request
+import threading
 
 # Import existing scraper class
 # Ensure dependencies are installed: gspread
@@ -353,6 +355,39 @@ def start_keep_alive_server():
     except Exception as e:
         print(f"Warning: Failed to start web server: {e}")
 
+def start_self_ping():
+    """
+    Background thread to ping the application's own external URL to prevent Render spin-down.
+    Render free instances spin down after 15 minutes of inactivity.
+    Pinging every 14 minutes (840 seconds) keeps it active.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        print("Self-ping: RENDER_EXTERNAL_URL not set. Skipping keep-alive ping (Local Mode).")
+        return
+
+    # Ensure URL starts with http
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    print(f"Self-ping: Active for {url} every 14 minutes.")
+
+    def pinger():
+        while True:
+            # Wait 14 minutes (840 seconds)
+            time.sleep(840)
+            try:
+                # Add a timestamp to avoid caching (optional but good practice)
+                ping_url = f"{url}/api/status?ping={int(time.time())}"
+                with urllib.request.urlopen(ping_url, timeout=10) as response:
+                     status = response.getcode()
+                     print(f"[{datetime.now().strftime('%H:%M:%S')}] Keep-alive ping sent to {url}. Status: {status}")
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Keep-alive ping failed: {e}")
+
+    thread = threading.Thread(target=pinger, daemon=True)
+    thread.start()
+
 def main():
     print("--- Starting Research Link Scraper Service (Production) ---")
     print(f"Monitoring Sheet ID: {config.SPREADSHEET_ID}")
@@ -360,6 +395,10 @@ def main():
     
     # Start the keep-alive server
     start_keep_alive_server()
+
+    # Start the self-ping mechanism
+    start_self_ping()
+    
     
     service = ResearchService()
     
