@@ -1,0 +1,21 @@
+# Exported from Render on 2026-02-03T05:46:51Z
+version: "1"
+projects:
+- name: My project
+  environments:
+  - name: Production
+    services:
+    - type: web
+      name: research-link-scraper
+      runtime: python
+      repo: https://github.com/MaddoxMorozov/research-link-scraper
+      plan: free
+      envVars:
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      region: virginia
+      buildCommand: pip install -r requirements.txt
+      startCommand: python main_service.py
+      autoDeployTrigger: commit
