@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.claude/
+.agents/
+*.log
+test_*.py
+failed_links.log
+service.log
+scraped_data_*.md
+token.json
+credentials.json
+.env
