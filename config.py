@@ -35,3 +35,13 @@ POLL_INTERVAL = 1800
 # 4. OUTPUT SETTINGS
 # Google Drive Folder ID to upload scraped files to
 SCOPED_DATA_FOLDER_ID = "1vGkpGQakXrhNfk_YJn2SZUMdcZQTLQXk"
+
+# 5. PLAYWRIGHT SETTINGS
+# Maximum concurrent Playwright browser tabs. Keep low for 512MB RAM (Render Free).
+PLAYWRIGHT_MAX_PAGES = 3
+
+# Navigation timeout in milliseconds
+PLAYWRIGHT_TIMEOUT = 30000
+
+# Kill switch to disable Playwright without code changes
+PLAYWRIGHT_ENABLED = True

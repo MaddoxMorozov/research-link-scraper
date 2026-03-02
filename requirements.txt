@@ -9,3 +9,5 @@ lxml
 pypdf
 aiohttp
 gspread
+playwright
+playwright-stealth

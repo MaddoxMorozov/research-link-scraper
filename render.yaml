@@ -15,7 +15,9 @@ projects:
         sync: false
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
       region: virginia
-      buildCommand: pip install -r requirements.txt
+      buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
       startCommand: python main_service.py
       autoDeployTrigger: commit

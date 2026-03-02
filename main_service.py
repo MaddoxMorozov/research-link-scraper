@@ -19,6 +19,14 @@ except ImportError:
     print("Error: scraper.py not found or dependencies missing.")
     sys.exit(1)
 
+# Import Playwright browser pool (optional - graceful degradation if unavailable)
+try:
+    from playwright_scraper import PlaywrightBrowserPool
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logging.warning("Playwright not available. Falling back to curl_cffi only.")
+
 # Import configuration
 import config
 
@@ -216,8 +224,45 @@ class ResearchService:
 
         # Run async scraping
         async def run_scrape():
-            tasks = [self.scraper.process_link(link) for link in links]
-            await asyncio.gather(*tasks)
+            # Create a Playwright browser pool for this batch (lazy - won't launch
+            # Chromium unless a URL actually needs it after curl_cffi fails)
+            pool = None
+            if PLAYWRIGHT_AVAILABLE and config.PLAYWRIGHT_ENABLED:
+                try:
+                    pool = PlaywrightBrowserPool(max_pages=config.PLAYWRIGHT_MAX_PAGES)
+                    self.scraper.browser_pool = pool
+                    logging.info("Playwright browser pool ready (lazy - will launch on first need).")
+                except Exception as e:
+                    logging.warning(f"Playwright pool creation failed, continuing without it: {e}")
+                    pool = None
+                    self.scraper.browser_pool = None
+            else:
+                self.scraper.browser_pool = None
+
+            try:
+                # Limit concurrency to avoid overwhelming the browser pool
+                # and reduce rate-detection from target sites
+                sem = asyncio.Semaphore(10)
+
+                async def rate_limited_process(link):
+                    async with sem:
+                        return await self.scraper.process_link(link)
+
+                tasks = [rate_limited_process(link) for link in links]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Log any unhandled exceptions from individual tasks
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logging.error(f"Task error for {links[i]}: {result}")
+            finally:
+                # Always shut down the browser after the batch to free memory
+                if pool:
+                    try:
+                        await pool.shutdown()
+                    except Exception as e:
+                        logging.warning(f"Error shutting down Playwright pool: {e}")
+                self.scraper.browser_pool = None
 
         # Track duration
         start_time = time.time()

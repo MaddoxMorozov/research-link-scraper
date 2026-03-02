@@ -19,6 +19,7 @@ import io
 from pypdf import PdfReader
 # Import config
 import config
+from playwright_scraper import PlaywrightBrowserPool, scrape_with_playwright, is_block_page
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = [
@@ -37,11 +38,16 @@ logging.basicConfig(
     ]
 )
 
+# Suppress noisy third-party loggers
+logging.getLogger('trafilatura').setLevel(logging.ERROR)
+logging.getLogger('htmldate').setLevel(logging.ERROR)
+
 class DocScraper:
     def __init__(self):
         self.creds = self._authenticate()
         self.output_file = "raw_scraped_content.md"
         self.failed_log = "failed_links.log"
+        self.browser_pool = None  # Set by main_service.py per batch
 
     def _authenticate(self):
         creds = None
@@ -151,39 +157,99 @@ class DocScraper:
             
         return links
 
+    def _extract_youtube_video_id(self, url):
+        """Extract video ID from any YouTube URL format.
+
+        Handles:
+          - youtube.com/watch?v=VIDEO_ID
+          - youtu.be/VIDEO_ID
+          - youtube.com/shorts/VIDEO_ID
+          - youtube.com/embed/VIDEO_ID
+          - youtube.com/v/VIDEO_ID
+          - URLs with extra params (?si=, &t=, ?utm_source=, etc.)
+
+        Returns None for non-video URLs (channels, playlists, etc.)
+        """
+        # Skip non-video URLs early
+        non_video_patterns = [
+            r'youtube\.com/@',           # Channel handles
+            r'youtube\.com/c/',          # Channel old format
+            r'youtube\.com/channel/',    # Channel ID format
+            r'youtube\.com/user/',       # User pages
+            r'youtube\.com/playlist\?',  # Playlists
+        ]
+        for pattern in non_video_patterns:
+            if re.search(pattern, url):
+                return None
+
+        # Try each video URL pattern
+        video_patterns = [
+            r'(?:v=)([0-9A-Za-z_-]{11})',                          # ?v=VIDEO_ID
+            r'youtu\.be/([0-9A-Za-z_-]{11})',                      # youtu.be/VIDEO_ID
+            r'youtube\.com/shorts/([0-9A-Za-z_-]{11})',             # /shorts/VIDEO_ID
+            r'youtube\.com/embed/([0-9A-Za-z_-]{11})',              # /embed/VIDEO_ID
+            r'youtube\.com/v/([0-9A-Za-z_-]{11})',                  # /v/VIDEO_ID
+        ]
+        for pattern in video_patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+
+        return None
+
     async def scrape_youtube(self, url):
-        video_id_match = re.search(r'(?:v=|\\/)([0-9A-Za-z_-]{11}).*', url)
-        if not video_id_match:
-            return None, "Invalid YouTube URL"
-        
-        video_id = video_id_match.group(1)
+        video_id = self._extract_youtube_video_id(url)
+
+        if not video_id:
+            # Determine if it's a known non-video URL type for clearer error message
+            if any(x in url for x in ['/@', '/c/', '/channel/', '/user/']):
+                return None, "YouTube channel URL (not a video) - skipping"
+            if 'playlist' in url:
+                return None, "YouTube playlist URL (not a single video) - skipping"
+            return None, "Could not extract video ID from YouTube URL"
+
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
-            
+
             # Try multiple common patterns for the YouTube API
             transcript_list = None
             if hasattr(YouTubeTranscriptApi, 'get_transcript'):
                 transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
             elif hasattr(YouTubeTranscriptApi, 'list_transcripts'):
                 transcript_list = YouTubeTranscriptApi.list_transcripts(video_id).find_transcript(['en']).fetch()
-            
+
             if transcript_list:
                 transcript_text = " ".join([item['text'] for item in transcript_list])
                 return transcript_text, None
         except Exception as e:
             logging.warning(f"YouTube API failed for {video_id}: {str(e)}. Trying Jina fallback...")
-        
+
         # JINA FALLBACK for YouTube
-        jina_url = f"https://r.jina.ai/{url}"
+        # Normalize to standard watch URL for Jina (works better than short URLs)
+        normalized_url = f"https://www.youtube.com/watch?v={video_id}"
+        jina_url = f"https://r.jina.ai/{normalized_url}"
         try:
             async with AsyncSession(impersonate="chrome110") as s:
                 resp = await s.get(jina_url, timeout=25)
                 if resp.status_code == 200 and len(resp.text) > 200:
-                    return f"[JINA YOUTUBE VERSION] {self._sanitize_text(resp.text)}", None
+                    sanitized = self._sanitize_text(resp.text)
+                    if not is_block_page(sanitized):
+                        return f"[JINA YOUTUBE VERSION] {sanitized}", None
         except Exception as e:
             pass
 
-        return None, "YouTube transcript unavailable via API or Jina"
+        # PLAYWRIGHT FALLBACK for YouTube: Scrape the page itself for title, description, comments
+        if self.browser_pool:
+            try:
+                html, pw_error = await scrape_with_playwright(self.browser_pool, normalized_url)
+                if html:
+                    extracted = self._extract_text_from_html(html)
+                    if extracted and not is_block_page(extracted) and len(extracted) > 100:
+                        return f"[PLAYWRIGHT YOUTUBE PAGE] {extracted}", None
+            except Exception as e:
+                logging.debug(f"Playwright YouTube fallback failed: {str(e)}")
+
+        return None, "YouTube transcript unavailable via API, Jina, or Playwright"
 
     def _clean_url(self, url):
         """Remove UTM and other common tracking parameters that might trigger bot detection."""
@@ -218,6 +284,56 @@ class DocScraper:
         except Exception as e:
             return None
 
+    def _extract_text_from_html(self, html):
+        """Extract readable text from HTML using trafilatura with BS4 fallback."""
+        result = trafilatura.extract(html)
+        if result:
+            return self._sanitize_text(result)
+
+        soup = BeautifulSoup(html, 'lxml')
+        for script in soup(["script", "style"]):
+            script.decompose()
+
+        main_content = (soup.find('main') or soup.find('article') or
+                       soup.find('div', class_=re.compile(r'content|main|body', re.I)))
+        if main_content:
+            text = main_content.get_text(separator=' ')
+        else:
+            text = soup.get_text(separator=' ')
+
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+
+        return self._sanitize_text(text) if text.strip() else None
+
+    def _should_try_playwright(self, last_status_code=None, last_error=None):
+        """Determine if a failed curl_cffi attempt warrants a Playwright retry.
+
+        Triggers Playwright for:
+          - 401/403: Bot protection / Cloudflare blocking
+          - 405: Server rejects curl_cffi's request method
+          - 429: Rate limiting (real browser may bypass)
+          - 202: Server accepted but didn't return content (JS-rendered SPAs)
+          - 500: Server error that may be caused by bot detection
+          - Empty extracted text: JS-rendered page that curl_cffi can't render
+          - Block/consent page detected: curl_cffi got 200 but content is garbage
+        """
+        if self.browser_pool is None:
+            return False
+        if last_status_code in [401, 403, 405, 429, 202, 500]:
+            return True
+        if last_error and any(phrase in last_error.lower() for phrase in [
+            'extracted text was empty',
+            'failed after trying',
+            'unsupported content-type',
+            'block',
+            'consent',
+            'challenge',
+        ]):
+            return True
+        return False
+
     async def _get_wayback_url(self, url):
         """Try to find the most recent archived version of a URL on Wayback Machine."""
         api_url = f"https://archive.org/wayback/available?url={url}"
@@ -233,17 +349,107 @@ class DocScraper:
             pass
         return None
 
+    async def _try_google_cache(self, url):
+        """Try to fetch content from Google's web cache."""
+        cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
+        try:
+            async with AsyncSession(impersonate="chrome120") as s:
+                resp = await s.get(cache_url, timeout=15, allow_redirects=True)
+                if resp.status_code == 200:
+                    extracted = self._extract_text_from_html(resp.text)
+                    if extracted and not is_block_page(extracted) and len(extracted) > 200:
+                        return extracted
+        except Exception as e:
+            logging.debug(f"Google Cache failed for {url}: {str(e)}")
+        return None
+
+    async def _try_archive_today(self, url):
+        """Try to fetch content from archive.today (archive.ph)."""
+        archive_api = f"https://archive.ph/newest/{url}"
+        try:
+            async with AsyncSession(impersonate="chrome120") as s:
+                resp = await s.get(archive_api, timeout=15, allow_redirects=True)
+                if resp.status_code == 200:
+                    extracted = self._extract_text_from_html(resp.text)
+                    if extracted and not is_block_page(extracted) and len(extracted) > 200:
+                        return extracted
+        except Exception as e:
+            logging.debug(f"archive.today failed for {url}: {str(e)}")
+        return None
+
+    async def _try_sciencedirect_abstract(self, url):
+        """Try to extract ScienceDirect paper metadata via APIs when Cloudflare blocks direct access."""
+        # Extract PII from ScienceDirect URL
+        pii_match = re.search(r'/pii/([A-Z0-9]+)', url, re.IGNORECASE)
+        if not pii_match:
+            return None
+        pii = pii_match.group(1)
+
+        # Try Semantic Scholar API (free, no auth needed)
+        try:
+            sem_url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:10.1016/{pii[:4]}.{pii[4:]}?fields=title,abstract,authors,year,citationCount"
+            async with AsyncSession() as s:
+                resp = await s.get(sem_url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    parts = []
+                    if data.get('title'):
+                        parts.append(f"Title: {data['title']}")
+                    if data.get('authors'):
+                        authors = ', '.join(a.get('name', '') for a in data['authors'][:10])
+                        parts.append(f"Authors: {authors}")
+                    if data.get('year'):
+                        parts.append(f"Year: {data['year']}")
+                    if data.get('abstract'):
+                        parts.append(f"Abstract: {data['abstract']}")
+                    if data.get('citationCount'):
+                        parts.append(f"Citations: {data['citationCount']}")
+                    if parts:
+                        return '\n'.join(parts)
+        except Exception as e:
+            logging.debug(f"Semantic Scholar failed for {pii}: {str(e)}")
+
+        # Try CrossRef API as backup
+        try:
+            cr_url = f"https://api.crossref.org/works?query.bibliographic={pii}&rows=1"
+            async with AsyncSession() as s:
+                resp = await s.get(cr_url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get('message', {}).get('items', [])
+                    if items:
+                        item = items[0]
+                        parts = []
+                        if item.get('title'):
+                            parts.append(f"Title: {item['title'][0]}")
+                        if item.get('author'):
+                            authors = ', '.join(f"{a.get('given', '')} {a.get('family', '')}" for a in item['author'][:10])
+                            parts.append(f"Authors: {authors}")
+                        if item.get('abstract'):
+                            parts.append(f"Abstract: {item['abstract']}")
+                        if parts:
+                            return '\n'.join(parts)
+        except Exception as e:
+            logging.debug(f"CrossRef failed for {pii}: {str(e)}")
+
+        return None
+
     async def scrape_general(self, url):
         clean_url = self._clean_url(url)
-        
+
         # Multiple impersonation targets to try
-        fingerprints = ["chrome110", "safari15_5", "firefox107"]
-        
+        # NOTE: firefox107 removed — no longer supported by curl_cffi
+        fingerprints = ["chrome110", "safari15_5", "chrome120"]
+
+        # Track last failure reason for Playwright fallback decision
+        last_status_code = None
+        last_error = None
+
         for fp in fingerprints:
             try:
                 # Add a small random jitter to avoid rapid-fire detection
                 await asyncio.sleep(random.uniform(0.5, 1.5))
-                
+
                 headers = {
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
@@ -262,10 +468,10 @@ class DocScraper:
 
                 async with AsyncSession(impersonate=fp) as s:
                     response = await s.get(clean_url, timeout=25, allow_redirects=True, headers=headers)
-                    
+
                     if response.status_code == 200:
                         content_type = response.headers.get("Content-Type", "").lower()
-                        
+
                         # Handle PDFs
                         if "application/pdf" in content_type or clean_url.endswith(".pdf"):
                             logging.info(f"Detected PDF content at {clean_url}")
@@ -277,41 +483,57 @@ class DocScraper:
                         # Handle HTML/Text
                         if "text/html" in content_type or "text/plain" in content_type:
                             html = response.text
-                            # Use trafilatura but allow fallback
-                            result = trafilatura.extract(html)
-                            if result:
-                                return self._sanitize_text(result), None
-                            
-                            soup = BeautifulSoup(html, 'lxml')
-                            for script in soup(["script", "style"]):
-                                script.decompose()
-                            
-                            # Try to find common content containers if trafilatura failed
-                            main_content = soup.find('main') or soup.find('article') or soup.find('div', class_=re.compile(r'content|main|body', re.I))
-                            if main_content:
-                                text = main_content.get_text(separator=' ')
+                            extracted = self._extract_text_from_html(html)
+                            if extracted and not is_block_page(extracted):
+                                return extracted, None
+                            elif extracted:
+                                last_error = "Extracted text was a block/consent page"
+                                logging.warning(f"curl_cffi got block page from {clean_url} with {fp}, trying next...")
+                                continue
                             else:
-                                text = soup.get_text(separator=' ')
+                                last_error = "Extracted text was empty"
+                                continue  # Try next fingerprint before giving up
 
-                            lines = (line.strip() for line in text.splitlines())
-                            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-                            text = '\n'.join(chunk for chunk in chunks if chunk)
-                            
-                            if text.strip():
-                                return self._sanitize_text(text), None
-                            else:
-                                return None, "Extracted text was empty"
-                        
                         return None, f"Unsupported Content-Type: {content_type}"
-                    
-                    elif response.status_code in [401, 403]:
+
+                    elif response.status_code == 429:
+                        # Rate limited — wait and retry with next fingerprint
+                        last_status_code = response.status_code
+                        logging.warning(f"Got 429 (rate limited) for {clean_url} with {fp}, waiting 5s before next fingerprint...")
+                        await asyncio.sleep(5)
+                        continue
+
+                    elif response.status_code in [401, 403, 405, 202, 500]:
+                        # These status codes may be fixable by Playwright or next fingerprint
+                        last_status_code = response.status_code
                         logging.warning(f"Got {response.status_code} for {clean_url} with {fp}, trying next fingerprint...")
-                        continue # Try next fingerprint
+                        continue # Try next fingerprint, then Playwright
                     else:
+                        # Genuine errors (404, etc.) - no point retrying
+                        last_status_code = response.status_code
                         return None, f"HTTP Error {response.status_code}"
             except Exception as e:
+                last_error = str(e)
                 logging.error(f"Error scraping {clean_url} with {fp}: {str(e)}")
                 continue
+
+        # PLAYWRIGHT FALLBACK: For sites with JS challenges (Cloudflare, etc.)
+        if self._should_try_playwright(last_status_code, last_error):
+            logging.info(f"Trying Playwright (headless browser) fallback for {clean_url}...")
+            try:
+                html, pw_error = await scrape_with_playwright(self.browser_pool, clean_url)
+                if html:
+                    extracted = self._extract_text_from_html(html)
+                    if extracted and not is_block_page(extracted):
+                        return f"[PLAYWRIGHT] {extracted}", None
+                    elif extracted:
+                        logging.warning(f"Playwright returned a block/error page for {clean_url}, falling through...")
+                    else:
+                        logging.warning(f"Playwright got HTML but extraction yielded no text for {clean_url}")
+                else:
+                    logging.warning(f"Playwright fallback failed for {clean_url}: {pw_error}")
+            except Exception as e:
+                logging.error(f"Playwright error for {clean_url}: {str(e)}")
 
         # SECONDARY FALLBACK: Jina Reader (Very effective for G2/TrustRadius)
         logging.info(f"Trying Jina Reader fallback for {clean_url}...")
@@ -320,9 +542,25 @@ class DocScraper:
             async with AsyncSession(impersonate="chrome110") as s:
                 resp = await s.get(jina_url, timeout=25)
                 if resp.status_code == 200 and len(resp.text) > 200:
-                    return f"[JINA READER VERSION] {self._sanitize_text(resp.text)}", None
+                    sanitized = self._sanitize_text(resp.text)
+                    if not is_block_page(sanitized):
+                        return f"[JINA READER VERSION] {sanitized}", None
+                    else:
+                        logging.warning(f"Jina Reader returned a block/error page for {clean_url}, falling through...")
         except Exception as e:
             logging.error(f"Jina Reader failed for {clean_url}: {str(e)}")
+
+        # GOOGLE CACHE FALLBACK: Often has recent copies of pages
+        logging.info(f"Trying Google Cache fallback for {clean_url}...")
+        cache_result = await self._try_google_cache(clean_url)
+        if cache_result:
+            return f"[GOOGLE CACHE] {cache_result}", None
+
+        # ARCHIVE.TODAY FALLBACK: Community-maintained archive, good for paywalled content
+        logging.info(f"Trying archive.today fallback for {clean_url}...")
+        archive_result = await self._try_archive_today(clean_url)
+        if archive_result:
+            return f"[ARCHIVE.TODAY] {archive_result}", None
 
         # ULTIMATE FALLBACK: Wayback Machine
         logging.info(f"All other methods failed for {clean_url}. Trying Wayback Machine fallback...")
@@ -338,17 +576,183 @@ class DocScraper:
             except Exception as e:
                 logging.error(f"Wayback fallback failed for {clean_url}: {str(e)}")
 
-        return None, "Failed after trying multiple fingerprints, Jina Reader, and Wayback Machine"
+        return None, "Failed after trying all methods (curl_cffi, Playwright, Jina, Google Cache, archive.today, Wayback)"
+
+    def _convert_reddit_url(self, url):
+        """Convert any Reddit URL to old.reddit.com for reliable scraping.
+
+        old.reddit.com serves plain HTML without heavy JS/React, making it
+        scrapable with curl_cffi without needing Playwright.
+        """
+        parsed = urlparse(url)
+        if parsed.hostname in ['www.reddit.com', 'reddit.com', 'new.reddit.com']:
+            return urlunparse(parsed._replace(netloc='old.reddit.com'))
+        return url
+
+    async def scrape_reddit(self, url):
+        """Scrape Reddit via old.reddit.com, JSON API, Jina, .compact, and Playwright fallbacks."""
+        old_url = self._convert_reddit_url(url)
+        logging.info(f"Reddit detected. Using old.reddit.com: {old_url}")
+
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        }
+
+        # Method 1: old.reddit.com HTML
+        try:
+            async with AsyncSession(impersonate="chrome110") as s:
+                response = await s.get(old_url, timeout=25, allow_redirects=True, headers=headers)
+                if response.status_code == 200:
+                    extracted = self._extract_text_from_html(response.text)
+                    if extracted and not is_block_page(extracted):
+                        return f"[REDDIT] {extracted}", None
+        except Exception as e:
+            logging.warning(f"Reddit old.reddit.com failed: {str(e)}")
+
+        # Method 2: Reddit JSON API (append .json to the URL)
+        # Works for most post URLs and bypasses HTML rendering entirely
+        try:
+            json_url = old_url.rstrip('/') + '.json'
+            json_headers = {
+                "User-Agent": "Mozilla/5.0 (research-link-scraper; academic)",
+                "Accept": "application/json",
+            }
+            async with AsyncSession() as s:
+                resp = await s.get(json_url, timeout=20, headers=json_headers)
+                if resp.status_code == 200:
+                    import json
+                    data = resp.json()
+                    parts = []
+                    # Extract post title and selftext
+                    if isinstance(data, list) and len(data) > 0:
+                        post_data = data[0].get('data', {}).get('children', [{}])[0].get('data', {})
+                        title = post_data.get('title', '')
+                        selftext = post_data.get('selftext', '')
+                        if title:
+                            parts.append(f"Title: {title}")
+                        if selftext:
+                            parts.append(f"Post: {selftext}")
+                        # Extract top comments
+                        if len(data) > 1:
+                            comments = data[1].get('data', {}).get('children', [])
+                            for c in comments[:10]:  # Top 10 comments
+                                cdata = c.get('data', {})
+                                body = cdata.get('body', '')
+                                if body:
+                                    parts.append(f"Comment: {body}")
+                    if parts:
+                        text = '\n\n'.join(parts)
+                        return f"[REDDIT JSON] {self._sanitize_text(text)}", None
+        except Exception as e:
+            logging.warning(f"Reddit JSON API failed: {str(e)}")
+
+        # Method 3: Jina Reader
+        jina_url = f"https://r.jina.ai/{url}"
+        try:
+            async with AsyncSession(impersonate="chrome110") as s:
+                resp = await s.get(jina_url, timeout=25)
+                if resp.status_code == 200 and len(resp.text) > 200:
+                    sanitized = self._sanitize_text(resp.text)
+                    if not is_block_page(sanitized):
+                        return f"[JINA REDDIT VERSION] {sanitized}", None
+                    else:
+                        logging.warning(f"Jina Reddit returned a block/error page, falling through...")
+        except Exception as e:
+            logging.warning(f"Jina Reddit fallback failed: {str(e)}")
+
+        # Method 4: .compact mobile view (lightweight, often less blocked)
+        try:
+            compact_url = old_url.rstrip('/') + '/.compact'
+            async with AsyncSession(impersonate="chrome120") as s:
+                resp = await s.get(compact_url, timeout=20, allow_redirects=True, headers=headers)
+                if resp.status_code == 200:
+                    extracted = self._extract_text_from_html(resp.text)
+                    if extracted and not is_block_page(extracted):
+                        return f"[REDDIT COMPACT] {extracted}", None
+        except Exception as e:
+            logging.warning(f"Reddit .compact fallback failed: {str(e)}")
+
+        # Method 5: Playwright for Reddit (use www.reddit.com, NOT old.reddit.com)
+        # Playwright can handle JS-rendered Reddit; old.reddit.com blocks headless browsers
+        if self.browser_pool:
+            try:
+                # Use the original www.reddit.com URL for Playwright
+                parsed = urlparse(url)
+                www_url = urlunparse(parsed._replace(netloc='www.reddit.com'))
+                await asyncio.sleep(2)  # Extra delay to avoid rate detection
+                html, pw_error = await scrape_with_playwright(self.browser_pool, www_url)
+                if html:
+                    extracted = self._extract_text_from_html(html)
+                    if extracted and not is_block_page(extracted):
+                        return f"[PLAYWRIGHT REDDIT] {extracted}", None
+            except Exception as e:
+                logging.error(f"Playwright Reddit fallback failed: {str(e)}")
+
+        # Method 6: Google Cache as last resort for Reddit
+        cache_result = await self._try_google_cache(url)
+        if cache_result:
+            return f"[GOOGLE CACHE REDDIT] {cache_result}", None
+
+        return None, "Reddit scraping failed via old.reddit.com, JSON API, Jina, compact, Playwright, and Google Cache"
 
     async def process_link(self, url):
         logging.info(f"Processing: {url}")
         content = None
         error = None
 
+        # Route to specialized scrapers based on domain
         if "youtube.com" in url or "youtu.be" in url:
             content, error = await self.scrape_youtube(url)
+        elif "reddit.com" in url:
+            content, error = await self.scrape_reddit(url)
+        elif "linkedin.com" in url:
+            # LinkedIn blocks all scraping. Try Jina first (best chance), then general.
+            jina_url = f"https://r.jina.ai/{url}"
+            try:
+                async with AsyncSession(impersonate="chrome110") as s:
+                    resp = await s.get(jina_url, timeout=25)
+                    if resp.status_code == 200 and len(resp.text) > 200:
+                        sanitized = self._sanitize_text(resp.text)
+                        if not is_block_page(sanitized):
+                            content = f"[JINA LINKEDIN] {sanitized}"
+                        else:
+                            logging.warning(f"Jina LinkedIn returned a block/error page for {url}")
+            except Exception:
+                pass
+            if not content:
+                content, error = await self.scrape_general(url)
+        elif "reuters.com" in url:
+            # Reuters has aggressive paywall. Try archive.today first, then general.
+            logging.info(f"Reuters detected. Trying archive.today first for {url}...")
+            archive_result = await self._try_archive_today(url)
+            if archive_result:
+                content = f"[ARCHIVE.TODAY REUTERS] {archive_result}"
+            else:
+                # Try Google Cache
+                cache_result = await self._try_google_cache(url)
+                if cache_result:
+                    content = f"[GOOGLE CACHE REUTERS] {cache_result}"
+                else:
+                    content, error = await self.scrape_general(url)
+        elif "sciencedirect.com" in url:
+            # ScienceDirect has unbeatable Cloudflare. Try abstract APIs first.
+            logging.info(f"ScienceDirect detected. Trying academic APIs for metadata...")
+            api_result = await self._try_sciencedirect_abstract(url)
+            if api_result:
+                content = f"[ACADEMIC API] {api_result}"
+            else:
+                content, error = await self.scrape_general(url)
         else:
             content, error = await self.scrape_general(url)
+
+        # FINAL GATE: Reject block pages, cookie consent, login walls, etc.
+        # This catches garbage content regardless of which method produced it.
+        if content and is_block_page(content):
+            logging.warning(f"FINAL GATE REJECTED content for {url} (block/consent/login page detected)")
+            content = None
+            error = "Content was a block page, cookie consent, or login wall"
 
         if content:
             with open(self.output_file, "a", encoding="utf-8") as f:
